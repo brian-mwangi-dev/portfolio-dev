@@ -1,0 +1,46 @@
+{
+  "app": "npx ts-node bin/app.ts",
+  "watch": {
+    "include": [
+      "**"
+    ],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "images",
+      "*.pyc",
+      "source.bat",
+      "**/__pycache__",
+      "**/.pytest_cache"
+    ]
+  },
+  "context": {
+    "@aws-cdk/core:enableStackNameDuplicates": true,
+    "@aws-cdk/aws-apigateway:usagePlanKeyOrderInsensitiveId": true,
+    "@aws-cdk/core:stackRelativeExports": true,
+    "@aws-cdk/aws-rds:lowercaseDbIdentifier": true,
+    "@aws-cdk/aws-apigateway:disableCloudWatchRole": true,
+    "@aws-cdk/core:newStyleStackSynthesis": true,
+    "@aws-cdk/aws-apigateway:disableExecuteApiEndpointDiscovery": true,
+    "@aws-cdk/services-apigateway-canary:useSeparateWafScope": true,
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/aws-cloudwatch-actions:changeLambdaErrorReportingfrequency": true,
+    "@aws-cdk/aws-logs-destinations:adaptErrorMessage": true,
+    "@aws-cdk/aws-sns-subscriptions:renderMessagePerSubscriptionType": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:strictBudgetConstraint": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:validateSnapshotRemovalPolicy": true,
+    "@aws-cdk/aws-codepipeline:crossAccountKeyAliasStackSafeId": true,
+    "@aws-cdk/aws-s3:grantWriteWithoutAcl": true,
+    "@aws-cdk/aws-ecs-patterns:removeDefaultDesktopTcpPort": true,
+    "@aws-cdk/aws-lambda-nodejs:useLatestRuntimeVersion": true,
+    "@aws-cdk/core:inlineHashingVersion": "0",
+    "@aws-cdk/core:skipRegionValidation": true,
+    "@aws-cdk-containers/ecs-service-extensions:enableDefaultLogDriver": true,
+    "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true,
+    "@aws-cdk/aws-apigateway:authorizerChangeDeploymentLogicalId": true,
+    "@aws-cdk/aws-rds:preventRenderingRDSInstanceResourceArnAsSeparateAttribute": true,
+    "@aws-cdk/core:useLegacyChainableGetAttModel": true
+  }
+}
