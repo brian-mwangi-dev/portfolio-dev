@@ -1,0 +1,165 @@
+name: Melduo Deploy — Portfolio (Static CloudFront)
+
+on:
+  push:
+    branches:
+      - melduo/deploy-cmr11m2m
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: "20"
+
+jobs:
+  deploy:
+    name: Build & Deploy to S3 + CloudFront
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Configure AWS credentials via OIDC ──────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── 3. Set up Node.js ──────────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ── 4. Install CDK dependencies ────────────────────────────────────────
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm ci --prefer-offline || npm install
+
+      # ── 5. Deploy CDK stack (S3 bucket + CloudFront distribution) ──────────
+      - name: Deploy CDK stack
+        working-directory: infra
+        run: |
+          npx cdk deploy PortfolioStack \
+            --require-approval never \
+            --outputs-file ../cdk-outputs.json \
+            --ci
+
+      # ── 6. Extract stack outputs ───────────────────────────────────────────
+      - name: Extract stack outputs
+        id: stack-outputs
+        run: |
+          BUCKET_NAME=$(jq -r '.PortfolioStack.BucketName' cdk-outputs.json)
+          DISTRIBUTION_ID=$(jq -r '.PortfolioStack.DistributionId' cdk-outputs.json)
+          CLOUDFRONT_URL=$(jq -r '.PortfolioStack.CloudFrontURL' cdk-outputs.json)
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "distribution_id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+          echo "cloudfront_url=$CLOUDFRONT_URL" >> $GITHUB_OUTPUT
+          echo "✅ Bucket: $BUCKET_NAME"
+          echo "✅ Distribution: $DISTRIBUTION_ID"
+          echo "✅ URL: $CLOUDFRONT_URL"
+
+      # ── 7. Install app dependencies (bun preferred, npm fallback) ──────────
+      - name: Install app dependencies
+        run: |
+          if [ -f "bun.lock" ] || [ -f "bun.lockb" ]; then
+            npm install -g bun
+            bun install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      # ── 8. Configure Next.js for static export ────────────────────────────
+      - name: Ensure Next.js static export config
+        run: |
+          # Patch next.config.ts to add output: 'export' if not already set
+          if ! grep -q "output.*export" next.config.ts; then
+            cat > next.config.ts << 'EOF'
+          import type { NextConfig } from "next";
+
+          const nextConfig: NextConfig = {
+            output: "export",
+            trailingSlash: true,
+            images: {
+              unoptimized: true,
+            },
+          };
+
+          export default nextConfig;
+          EOF
+            echo "✅ Patched next.config.ts with output: export"
+          else
+            echo "✅ next.config.ts already has static export config"
+          fi
+
+      # ── 9. Build the Next.js static site ──────────────────────────────────
+      - name: Build Next.js static export
+        run: |
+          if command -v bun &> /dev/null; then
+            bun run build
+          else
+            npm run build
+          fi
+        env:
+          NODE_ENV: production
+
+      # ── 10. Verify build output ────────────────────────────────────────────
+      - name: Verify build output
+        run: |
+          if [ ! -d "out" ]; then
+            echo "❌ Build output directory 'out' not found!"
+            ls -la
+            exit 1
+          fi
+          echo "✅ Build output directory 'out' found"
+          echo "Files in out/:"
+          ls -la out/
+
+      # ── 11. Sync to S3 ────────────────────────────────────────────────────
+      - name: Sync static files to S3
+        run: |
+          BUCKET_NAME="${{ steps.stack-outputs.outputs.bucket_name }}"
+          echo "📦 Syncing to s3://$BUCKET_NAME ..."
+
+          # Sync HTML files with no-cache (always fresh)
+          aws s3 sync out/ s3://$BUCKET_NAME/ \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --exclude "*" \
+            --include "*.html"
+
+          # Sync static assets with long-term cache
+          aws s3 sync out/ s3://$BUCKET_NAME/ \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html"
+
+          echo "✅ S3 sync complete"
+
+      # ── 12. Invalidate CloudFront cache ───────────────────────────────────
+      - name: Invalidate CloudFront distribution
+        run: |
+          DISTRIBUTION_ID="${{ steps.stack-outputs.outputs.distribution_id }}"
+          echo "🔄 Invalidating CloudFront distribution $DISTRIBUTION_ID ..."
+          aws cloudfront create-invalidation \
+            --distribution-id $DISTRIBUTION_ID \
+            --paths "/*"
+          echo "✅ CloudFront invalidation created"
+
+      # ── 13. Print deployment summary ──────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║          🚀 Deployment Complete!                 ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  🪣 Bucket : ${{ steps.stack-outputs.outputs.bucket_name }}"
+          echo "║  🌍 URL    : ${{ steps.stack-outputs.outputs.cloudfront_url }}"
+          echo "╚══════════════════════════════════════════════════╝"
