@@ -1,0 +1,11 @@
+{
+  "app": "node bin/app.js",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk.context.json", "dist", "node_modules", ".git"]
+  },
+  "context": {
+    "@aws-cdk/core:enableStackNameDuplicates": true,
+    "availability-zones:enable-context-caching": true
+  }
+}
