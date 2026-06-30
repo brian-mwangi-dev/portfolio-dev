@@ -1,0 +1,96 @@
+name: Deploy Portfolio to AWS (S3 + CloudFront)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "melduo/deploy-cmr172d1" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Patch next.config.ts for static export
+        run: |
+          node -e "
+          const fs = require('fs');
+          let content = fs.readFileSync('next.config.ts', 'utf8');
+          if (!content.includes(\"output: 'export'\")) {
+            content = content.replace(
+              'const nextConfig: NextConfig = {',
+              \"const nextConfig: NextConfig = {\\n  output: 'export',\\n  images: { unoptimized: true },\"
+            );
+            fs.writeFileSync('next.config.ts', content);
+            console.log('Patched next.config.ts with static export settings');
+          } else {
+            console.log('next.config.ts already has static export configured');
+          }
+          "
+
+      - name: Build Next.js static export
+        run: npm run build
+
+      - name: Install CDK dependencies
+        run: cd infra && npm ci
+
+      - name: Deploy CDK stack
+        run: cd infra && npx cdk deploy --require-approval never --outputs-file ../cdk-outputs.json
+
+      - name: Parse CDK outputs
+        id: cdk-outputs
+        run: |
+          BUCKET_NAME=$(node -e "const o=require('./cdk-outputs.json'); console.log(o.PortfolioStack.BucketName)")
+          DISTRIBUTION_ID=$(node -e "const o=require('./cdk-outputs.json'); console.log(o.PortfolioStack.DistributionId)")
+          CLOUDFRONT_URL=$(node -e "const o=require('./cdk-outputs.json'); console.log(o.PortfolioStack.CloudFrontUrl)")
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "distribution_id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+          echo "cloudfront_url=$CLOUDFRONT_URL" >> $GITHUB_OUTPUT
+
+      - name: Sync HTML files to S3 (no cache)
+        run: |
+          aws s3 sync ./out s3://${{ steps.cdk-outputs.outputs.bucket_name }} \
+            --delete \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --content-type "text/html"
+
+      - name: Sync static assets to S3 (long cache)
+        run: |
+          aws s3 sync ./out s3://${{ steps.cdk-outputs.outputs.bucket_name }} \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.cdk-outputs.outputs.distribution_id }} \
+            --paths "/*"
+
+      - name: Deployment complete
+        run: |
+          echo "✅ Portfolio deployed successfully!"
+          echo "🌍 URL: ${{ steps.cdk-outputs.outputs.cloudfront_url }}"
