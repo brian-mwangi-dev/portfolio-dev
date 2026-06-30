@@ -1,0 +1,161 @@
+name: Deploy Portfolio to AWS (S3 + CloudFront)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: PortfolioStack
+  NODE_VERSION: '20'
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ── Checkout source ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # ── Configure AWS credentials (OIDC) ─────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Set up Node.js ────────────────────────────────────────────────────
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      # ── Install app dependencies ──────────────────────────────────────────
+      - name: Install app dependencies
+        run: npm ci --prefer-offline || npm install
+
+      # ── Patch next.config.ts for static export ────────────────────────────
+      - name: Enable static export in next.config.ts
+        run: |
+          node -e "
+          const fs = require('fs');
+          const path = 'next.config.ts';
+          let content = fs.readFileSync(path, 'utf8');
+          // Add output: 'export' and trailingSlash: true if not already present
+          if (!content.includes(\"output: 'export'\")) {
+            content = content.replace(
+              /const nextConfig: NextConfig = \{([^}]*)\}/,
+              \`const nextConfig: NextConfig = {\$1  output: 'export',\n  trailingSlash: true,\n}\`
+            );
+            fs.writeFileSync(path, content);
+            console.log('Patched next.config.ts with static export settings');
+          } else {
+            console.log('next.config.ts already has output: export');
+          }
+          "
+
+      # ── Build Next.js static export ───────────────────────────────────────
+      - name: Build Next.js static site
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # ── Deploy CDK infrastructure ─────────────────────────────────────────
+      - name: Set up Node.js for CDK
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm ci || npm install
+
+      - name: Compile CDK TypeScript
+        working-directory: infra
+        run: npx tsc --build
+
+      - name: Bootstrap CDK (idempotent)
+        working-directory: infra
+        run: npx cdk bootstrap aws://${{ env.CDK_DEFAULT_ACCOUNT || 'unknown' }}/${{ env.AWS_REGION }} --require-approval never || true
+        env:
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+
+      - name: Deploy CDK stack
+        id: cdk_deploy
+        working-directory: infra
+        run: |
+          npx cdk deploy ${{ env.STACK_NAME }} \
+            --require-approval never \
+            --outputs-file cdk-outputs.json \
+            --ci
+        env:
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+
+      # ── Extract stack outputs ──────────────────────────────────────────────
+      - name: Extract CDK stack outputs
+        id: stack_outputs
+        working-directory: infra
+        run: |
+          BUCKET_NAME=$(cat cdk-outputs.json | node -e "const d=require('/dev/stdin');console.log(d['${{ env.STACK_NAME }}']['BucketName'])")
+          DISTRIBUTION_ID=$(cat cdk-outputs.json | node -e "const d=require('/dev/stdin');console.log(d['${{ env.STACK_NAME }}']['DistributionId'])")
+          SITE_URL=$(cat cdk-outputs.json | node -e "const d=require('/dev/stdin');console.log(d['${{ env.STACK_NAME }}']['SiteUrl'])")
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "distribution_id=$DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+          echo "site_url=$SITE_URL" >> $GITHUB_OUTPUT
+          echo "✅ Bucket: $BUCKET_NAME"
+          echo "✅ Distribution: $DISTRIBUTION_ID"
+          echo "✅ Site URL: $SITE_URL"
+
+      # ── Sync static assets to S3 ──────────────────────────────────────────
+      - name: Sync static site to S3
+        run: |
+          aws s3 sync out/ s3://${{ steps.stack_outputs.outputs.bucket_name }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "*.txt" \
+            --region ${{ env.AWS_REGION }}
+
+          # Upload HTML files with short cache (always re-validate)
+          aws s3 sync out/ s3://${{ steps.stack_outputs.outputs.bucket_name }}/ \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --exclude "*" \
+            --include "*.html" \
+            --include "*.txt" \
+            --region ${{ env.AWS_REGION }}
+
+      # ── Invalidate CloudFront cache ───────────────────────────────────────
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.stack_outputs.outputs.distribution_id }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "✅ CloudFront invalidation created: $INVALIDATION_ID"
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Site URL** | ${{ steps.stack_outputs.outputs.site_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **S3 Bucket** | ${{ steps.stack_outputs.outputs.bucket_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CloudFront ID** | ${{ steps.stack_outputs.outputs.distribution_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
