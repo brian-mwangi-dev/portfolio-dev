@@ -1,0 +1,19 @@
+{
+  "name": "portfolio-infra",
+  "version": "1.0.0",
+  "description": "CDK infrastructure for portfolio static site",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.248.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "aws-cdk": "2.1114.1",
+    "typescript": "~5.9.3",
+    "@types/node": "^24.10.1"
+  }
+}
