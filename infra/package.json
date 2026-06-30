@@ -1,0 +1,23 @@
+{
+  "name": "portfolio-infra",
+  "version": "1.0.0",
+  "description": "CDK infrastructure for Next.js portfolio static site deployment",
+  "main": "lib/portfolio-stack.ts",
+  "scripts": {
+    "cdk": "cdk",
+    "build": "tsc",
+    "watch": "tsc -w",
+    "deploy": "npm run build && cdk deploy",
+    "synth": "npm run build && cdk synth",
+    "diff": "npm run build && cdk diff"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.248.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "aws-cdk": "2.114.1",
+    "typescript": "~5.9.3",
+    "@types/node": "^24"
+  }
+}
