@@ -1,0 +1,128 @@
+name: Melduo Deploy — Portfolio (S3 + CloudFront)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_repair:
+        description: "Repair a stuck CDK bootstrap stack before deploying"
+        required: false
+        default: "false"
+  push:
+    branches: ["melduo/deploy-cmr2hs1h"]
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Configure AWS credentials (OIDC) ──────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── 3. Set up Bun (app package manager) ──────────────────────────────────
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      # ── 4. Set up Node 22 (for CDK CLI) ──────────────────────────────────────
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ── 5. Install app dependencies ───────────────────────────────────────────
+      - name: Install app dependencies
+        run: bun install
+
+      # ── 6. Build Next.js static export ───────────────────────────────────────
+      - name: Build site (static export)
+        run: bun run build
+
+      # ── 7. Install CDK dependencies (infra/ has no lockfile → npm install) ───
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      # ── 8. CDK Bootstrap (self-healing) ──────────────────────────────────────
+      - name: CDK Bootstrap (self-healing)
+        working-directory: infra
+        env:
+          BOOTSTRAP_REPAIR: ${{ github.event.inputs.bootstrap_repair }}
+        run: |
+          STATUS=$(aws cloudformation describe-stacks --stack-name CDKToolkit \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+          if [ "$BOOTSTRAP_REPAIR" = "true" ] && echo "$STATUS" | \
+            grep -qE "DELETE_FAILED|ROLLBACK_COMPLETE|ROLLBACK_FAILED|UPDATE_ROLLBACK_FAILED|CREATE_FAILED"; then
+            echo "Repairing stuck CDKToolkit ($STATUS)…"
+            RETAIN=$(aws cloudformation describe-stack-events --stack-name CDKToolkit \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+              --output text | tr '\t' ' ')
+            if [ -n "$RETAIN" ]; then
+              aws cloudformation delete-stack --stack-name CDKToolkit --retain-resources $RETAIN
+            else
+              aws cloudformation delete-stack --stack-name CDKToolkit
+            fi
+            aws cloudformation wait stack-delete-complete --stack-name CDKToolkit || true
+          fi
+          npx cdk bootstrap
+
+      # ── 9. CDK Deploy ─────────────────────────────────────────────────────────
+      - name: CDK Deploy
+        working-directory: infra
+        run: npx cdk deploy PortfolioStack --require-approval never --outputs-file cdk-outputs.json
+
+      # ── 10. Read CDK outputs ──────────────────────────────────────────────────
+      - name: Read CDK outputs
+        id: cdk_outputs
+        working-directory: infra
+        run: |
+          BUCKET=$(jq -r '.PortfolioStack.BucketName' cdk-outputs.json)
+          DIST_ID=$(jq -r '.PortfolioStack.DistributionId' cdk-outputs.json)
+          SITE_URL=$(jq -r '.PortfolioStack.SiteUrl' cdk-outputs.json)
+          echo "bucket=$BUCKET"   >> "$GITHUB_OUTPUT"
+          echo "dist_id=$DIST_ID" >> "$GITHUB_OUTPUT"
+          echo "site_url=$SITE_URL" >> "$GITHUB_OUTPUT"
+          echo "Bucket:  $BUCKET"
+          echo "DistID:  $DIST_ID"
+          echo "SiteURL: $SITE_URL"
+
+      # ── 11. Sync site to S3 ───────────────────────────────────────────────────
+      - name: Sync site to S3
+        run: |
+          aws s3 sync out/ s3://${{ steps.cdk_outputs.outputs.bucket }} \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "*.json"
+          aws s3 sync out/ s3://${{ steps.cdk_outputs.outputs.bucket }} \
+            --delete \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --include "*.html" \
+            --include "*.json"
+
+      # ── 12. Invalidate CloudFront cache ───────────────────────────────────────
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.cdk_outputs.outputs.dist_id }} \
+            --paths "/*"
+
+      # ── 13. Print site URL ────────────────────────────────────────────────────
+      - name: Print site URL
+        run: |
+          echo "✅ Portfolio deployed!"
+          echo "🌐 Site URL: ${{ steps.cdk_outputs.outputs.site_url }}"
