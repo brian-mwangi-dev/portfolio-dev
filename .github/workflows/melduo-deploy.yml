@@ -30,6 +30,13 @@ jobs:
           role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ── Get AWS account ID ────────────────────────────────────────────────
+      - name: Get AWS account ID
+        id: aws-identity
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+
       # ── Node.js for CDK ───────────────────────────────────────────────────
       - name: Set up Node.js (for CDK)
         uses: actions/setup-node@v4
@@ -40,40 +47,26 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
-      # ── Install CDK dependencies ───────────────────────────────────────────
+      # ── Install CDK dependencies (no lockfile, so use npm install) ────────
       - name: Install CDK dependencies
         working-directory: infra
         run: npm install
 
-      # ── CDK Bootstrap (idempotent) ────────────────────────────────────────
+      # ── CDK Bootstrap (idempotent — safe to run on every deploy) ──────────
       - name: CDK Bootstrap
-        working-directory: infra
-        run: npx cdk bootstrap aws://${{ steps.aws-identity.outputs.account_id || '' }}/us-east-1 --require-approval never || true
-        env:
-          CDK_DEFAULT_ACCOUNT: ${{ steps.aws-identity.outputs.account_id }}
-
-      # ── Get AWS account ID ────────────────────────────────────────────────
-      - name: Get AWS account ID
-        id: aws-identity
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
-
-      # ── CDK Bootstrap (with account ID) ───────────────────────────────────
-      - name: CDK Bootstrap (with account)
         working-directory: infra
         run: npx cdk bootstrap aws://${{ steps.aws-identity.outputs.account_id }}/us-east-1 --require-approval never
         env:
           CDK_DEFAULT_ACCOUNT: ${{ steps.aws-identity.outputs.account_id }}
 
-      # ── CDK Deploy (creates/updates S3 + CloudFront) ─────────────────────
+      # ── CDK Deploy (creates/updates S3 bucket + CloudFront distribution) ──
       - name: CDK Deploy
         working-directory: infra
         run: npx cdk deploy ${{ env.STACK_NAME }} --require-approval never --outputs-file ../cdk-outputs.json
         env:
           CDK_DEFAULT_ACCOUNT: ${{ steps.aws-identity.outputs.account_id }}
 
-      # ── Parse CDK outputs ──────────────────────────────────────────────────
+      # ── Parse CDK stack outputs ────────────────────────────────────────────
       - name: Parse CDK outputs
         id: cdk-outputs
         run: |
@@ -87,27 +80,31 @@ jobs:
           echo "🌐 Distribution ID: ${DIST_ID}"
           echo "🔗 Site URL: ${DIST_URL}"
 
-      # ── Build Next.js static export ───────────────────────────────────────
+      # ── Install app dependencies with Bun ─────────────────────────────────
       - name: Install app dependencies
         run: bun install
 
+      # ── Build Next.js static export ───────────────────────────────────────
       - name: Build Next.js static site
         run: bun run build
 
-      # ── Upload to S3 ──────────────────────────────────────────────────────
-      - name: Upload to S3
+      # ── Upload static files to S3 ─────────────────────────────────────────
+      - name: Upload assets to S3 (long cache)
         run: |
           aws s3 sync out/ s3://${{ steps.cdk-outputs.outputs.bucket }}/ \
             --delete \
             --cache-control "public, max-age=31536000, immutable" \
             --exclude "*.html" \
-            --exclude "*.json"
-          # HTML and JSON files: shorter cache for easier updates
+            --exclude "*.json" \
+            --exclude "*.txt"
+
+      - name: Upload HTML/JSON to S3 (short cache)
+        run: |
           aws s3 sync out/ s3://${{ steps.cdk-outputs.outputs.bucket }}/ \
-            --delete \
             --cache-control "public, max-age=0, must-revalidate" \
             --include "*.html" \
-            --include "*.json"
+            --include "*.json" \
+            --include "*.txt"
 
       # ── Invalidate CloudFront cache ────────────────────────────────────────
       - name: Invalidate CloudFront cache
@@ -116,8 +113,8 @@ jobs:
             --distribution-id ${{ steps.cdk-outputs.outputs.distribution_id }} \
             --paths "/*"
 
-      # ── Print site URL ─────────────────────────────────────────────────────
+      # ── Print deployment summary ───────────────────────────────────────────
       - name: Deployment complete
         run: |
           echo "✅ Portfolio deployed successfully!"
-          echo "🔗 Site URL: ${{ steps.cdk-outputs.outputs.site_url }}"
+          echo "🔗 Live site: ${{ steps.cdk-outputs.outputs.site_url }}"
