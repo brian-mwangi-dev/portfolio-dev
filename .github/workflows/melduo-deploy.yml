@@ -1,0 +1,106 @@
+name: Deploy Portfolio to AWS (S3 + CloudFront)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_repair:
+        description: "Repair a stuck CDK bootstrap stack before deploying"
+        required: false
+        default: "false"
+  push:
+    branches: [ "melduo/deploy-cmr34ogn" ]
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── CDK (Node.js) ──────────────────────────────────────────────────────
+      - name: Set up Node.js for CDK
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      # ── App (Bun) ──────────────────────────────────────────────────────────
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install app dependencies
+        run: bun install
+
+      - name: Build static site
+        run: bun run build
+
+      # ── AWS Auth ───────────────────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── CDK Bootstrap ─────────────────────────────────────────────────────
+      - name: CDK Bootstrap (self-healing)
+        working-directory: infra
+        env:
+          BOOTSTRAP_REPAIR: ${{ github.event.inputs.bootstrap_repair }}
+        run: |
+          STATUS=$(aws cloudformation describe-stacks --stack-name CDKToolkit \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+          if [ "$BOOTSTRAP_REPAIR" = "true" ] && echo "$STATUS" | grep -qE \
+            "DELETE_FAILED|ROLLBACK_COMPLETE|ROLLBACK_FAILED|UPDATE_ROLLBACK_FAILED|CREATE_FAILED"; then
+            echo "Repairing stuck CDKToolkit ($STATUS)…"
+            RETAIN=$(aws cloudformation describe-stack-events --stack-name CDKToolkit \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+              --output text | tr '\t' ' ')
+            if [ -n "$RETAIN" ]; then
+              aws cloudformation delete-stack --stack-name CDKToolkit --retain-resources $RETAIN
+            else
+              aws cloudformation delete-stack --stack-name CDKToolkit
+            fi
+            aws cloudformation wait stack-delete-complete --stack-name CDKToolkit || true
+          fi
+          npx cdk bootstrap
+
+      # ── CDK Deploy ────────────────────────────────────────────────────────
+      - name: CDK Deploy
+        working-directory: infra
+        run: npx cdk deploy PortfolioStack --require-approval never --outputs-file cdk-outputs.json
+
+      # ── Sync to S3 & Invalidate CloudFront ───────────────────────────────
+      - name: Sync site to S3
+        working-directory: infra
+        run: |
+          BUCKET=$(jq -r '.PortfolioStack.BucketName' cdk-outputs.json)
+          echo "Syncing to s3://$BUCKET"
+          aws s3 sync ../out/ s3://$BUCKET/ --delete --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" --exclude "404.html"
+          aws s3 sync ../out/ s3://$BUCKET/ --delete --cache-control "no-cache, no-store, must-revalidate" \
+            --exclude "*" --include "*.html" --include "404.html"
+
+      - name: Invalidate CloudFront cache
+        working-directory: infra
+        run: |
+          DIST_ID=$(jq -r '.PortfolioStack.DistributionId' cdk-outputs.json)
+          echo "Invalidating CloudFront distribution: $DIST_ID"
+          aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+
+      - name: Print site URL
+        working-directory: infra
+        run: |
+          URL=$(jq -r '.PortfolioStack.DistributionDomainName' cdk-outputs.json)
+          echo "🚀 Portfolio live at: $URL"
