@@ -1,0 +1,116 @@
+name: Deploy Portfolio to AWS (S3 + CloudFront)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_repair:
+        description: "Repair a stuck CDK bootstrap stack before deploying"
+        required: false
+        default: "false"
+  push:
+    branches: [ "melduo/deploy-cmr332v9" ]
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: PortfolioStack
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── App build (Bun) ──────────────────────────────────────────────────
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install app dependencies
+        run: bun install
+
+      - name: Build Next.js static export
+        run: bun run build
+
+      # ── AWS credentials (OIDC) ───────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MELDUO_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── CDK bootstrap & deploy ───────────────────────────────────────────
+      - name: Set up Node.js (for CDK)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm install
+
+      - name: CDK Bootstrap (self-healing)
+        working-directory: infra
+        env:
+          BOOTSTRAP_REPAIR: ${{ github.event.inputs.bootstrap_repair }}
+        run: |
+          STATUS=$(aws cloudformation describe-stacks --stack-name CDKToolkit --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+          if [ "$BOOTSTRAP_REPAIR" = "true" ] && echo "$STATUS" | grep -qE "DELETE_FAILED|ROLLBACK_COMPLETE|ROLLBACK_FAILED|UPDATE_ROLLBACK_FAILED|CREATE_FAILED"; then
+            echo "Repairing stuck CDKToolkit ($STATUS)…"
+            RETAIN=$(aws cloudformation describe-stack-events --stack-name CDKToolkit --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" --output text | tr '\t' ' ')
+            if [ -n "$RETAIN" ]; then
+              aws cloudformation delete-stack --stack-name CDKToolkit --retain-resources $RETAIN
+            else
+              aws cloudformation delete-stack --stack-name CDKToolkit
+            fi
+            aws cloudformation wait stack-delete-complete --stack-name CDKToolkit || true
+          fi
+          npx cdk bootstrap
+
+      - name: CDK Deploy
+        working-directory: infra
+        run: npx cdk deploy ${{ env.STACK_NAME }} --require-approval never --outputs-file cdk-outputs.json
+
+      # ── Upload static assets to S3 ───────────────────────────────────────
+      - name: Read CDK outputs
+        id: cdk-outputs
+        working-directory: infra
+        run: |
+          BUCKET=$(jq -r '.PortfolioStack.BucketName' cdk-outputs.json)
+          DIST_ID=$(jq -r '.PortfolioStack.DistributionId' cdk-outputs.json)
+          DIST_URL=$(jq -r '.PortfolioStack.DistributionUrl' cdk-outputs.json)
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "distribution_id=$DIST_ID" >> $GITHUB_OUTPUT
+          echo "distribution_url=$DIST_URL" >> $GITHUB_OUTPUT
+
+      - name: Sync static assets to S3
+        run: |
+          aws s3 sync out/ s3://${{ steps.cdk-outputs.outputs.bucket }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "*.xml" \
+            --exclude "*.json"
+          # HTML files — shorter cache
+          aws s3 sync out/ s3://${{ steps.cdk-outputs.outputs.bucket }}/ \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html" \
+            --include "*.xml" \
+            --include "*.json"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.cdk-outputs.outputs.distribution_id }} \
+            --paths "/*"
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment complete!"
+          echo "🌐 Site URL: ${{ steps.cdk-outputs.outputs.distribution_url }}"
